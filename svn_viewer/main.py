@@ -482,12 +482,16 @@ class SvnBrowser:
 
 # ─── 入口 ─────────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+def main():
     if len(sys.argv) < 2:
-        print("Usage: python main.py <svn_url>")
-        print("Example: python main.py https://svn.apache.org/repos/asf/")
+        print("Usage: svn-viewer <svn_url>")
+        print("Example: svn-viewer https://svn.apache.org/repos/asf/")
         sys.exit(1)
 
     url = sys.argv[1]
     browser = SvnBrowser(url)
     browser.run()
+
+
+if __name__ == "__main__":
+    main()

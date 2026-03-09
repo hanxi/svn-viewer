@@ -1,3 +1,11 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["svn_viewer*"]
+
 [project]
 name = "svn-viewer"
 version = "0.1.1"
@@ -11,3 +19,6 @@ dependencies = [
     "term-image>=0.7.2",
     "urwid>=3.0.5",
 ]
+
+[project.scripts]
+svn-viewer = "svn_viewer.main:main"

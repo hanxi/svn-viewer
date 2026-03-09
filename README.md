@@ -20,28 +20,38 @@ A terminal UI browser for SVN repositories, with syntax highlighting and image p
 
 ## Installation
 
+Install from PyPI:
+
+```bash
+pip install svn-viewer
+```
+
+Or clone and install locally for development:
+
 ```bash
 git clone https://github.com/hanxi/svn-viewer.git
 cd svn-viewer
 pip install -e .
 ```
 
-Or install dependencies directly:
-
-```bash
-pip install urwid term-image pillow pygments
-```
-
 ## Usage
 
+Run directly without installing (via [uv](https://docs.astral.sh/uv/)):
+
 ```bash
-python main.py <svn_url>
+uvx svn-viewer <svn_url>
+```
+
+Or if installed via pip:
+
+```bash
+svn-viewer <svn_url>
 ```
 
 **Example:**
 
 ```bash
-python main.py https://svn.apache.org/repos/asf/
+uvx svn-viewer https://svn.apache.org/repos/asf/
 ```
 
 ## Keyboard Shortcuts

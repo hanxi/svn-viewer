@@ -149,8 +149,8 @@ wheels = [
 
 [[package]]
 name = "svn-viewer"
-version = "0.1.0"
-source = { virtual = "." }
+version = "0.1.1"
+source = { editable = "." }
 dependencies = [
     { name = "pillow" },
     { name = "pygments" },
