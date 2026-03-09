@@ -1,6 +1,6 @@
 [project]
 name = "svn-viewer"
-version = "0.1.0"
+version = "0.1.1"
 description = "A terminal UI browser for SVN repositories, with syntax highlighting and image preview"
 readme = "README.md"
 requires-python = ">=3.14"
