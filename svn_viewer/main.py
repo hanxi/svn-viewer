@@ -27,10 +27,53 @@ except ImportError:
 # 支持预览的图片扩展名
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif", ".ico"}
 
+# 已知的二进制文件扩展名（不支持文本预览）
+BINARY_EXTENSIONS = {
+    # Office 文档
+    ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt",
+    # PDF
+    ".pdf",
+    # 压缩包
+    ".zip", ".tar", ".gz", ".bz2", ".xz", ".rar", ".7z",
+    # 可执行文件 / 库
+    ".exe", ".dll", ".so", ".dylib", ".a", ".o",
+    # 字体
+    ".ttf", ".otf", ".woff", ".woff2",
+    # 音视频
+    ".mp3", ".mp4", ".avi", ".mov", ".mkv", ".flac", ".wav",
+    # 数据库
+    ".db", ".sqlite", ".sqlite3",
+}
 
 def is_image_file(filename: str) -> bool:
     return os.path.splitext(filename)[1].lower() in IMAGE_EXTENSIONS
 
+def is_binary_file(filename: str) -> bool:
+    return os.path.splitext(filename)[1].lower() in BINARY_EXTENSIONS
+
+def sanitize_for_urwid(text: str) -> str:
+    """
+    清理字符串，移除会导致 urwid 渲染崩溃的字符。
+
+    urwid 使用 wcwidth 库计算字符宽度，遇到宽度为 0 的字符（控制字符、
+    零宽字符、组合字符等）时，clip/space 模式会产生 sc=0 的 LayoutSegment，
+    触发 ValueError: (0, 0, 1) 崩溃。
+    """
+    import unicodedata
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\t", "    ")
+    cleaned = []
+    for char in text:
+        if char in ("\n", " "):
+            cleaned.append(char)
+            continue
+        category = unicodedata.category(char)
+        # Cc: 控制字符，Cf: 格式字符，Mn: 非间距组合字符，Me: 封闭组合字符
+        # 这些字符的 wcwidth 返回 0 或 -1，会导致 urwid 崩溃
+        if category in ("Cc", "Cf", "Mn", "Me"):
+            continue
+        cleaned.append(char)
+    return "".join(cleaned)
 
 # ─── SVN 操作 ────────────────────────────────────────────────────────────────
 
@@ -63,15 +106,27 @@ def svn_list(url: str) -> list[dict]:
         return []
 
 
+def decode_bytes(raw: bytes) -> str:
+    """尝试多种编码解码字节内容，优先 UTF-8，fallback 到 GBK，最后用 latin-1 兜底"""
+    for encoding in ("utf-8", "gbk", "gb2312", "big5"):
+        try:
+            return raw.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    # latin-1 可以解码任意字节，不会抛异常
+    return raw.decode("latin-1")
+
+
 def svn_cat(url: str) -> str:
-    """获取 SVN 文件文本内容"""
+    """获取 SVN 文件文本内容，自动处理非 UTF-8 编码（如 GBK）"""
     try:
         result = subprocess.run(
-            ["svn", "cat", url], capture_output=True, text=True, check=True
+            ["svn", "cat", url], capture_output=True, check=True
         )
-        return result.stdout
+        return decode_bytes(result.stdout)
     except subprocess.CalledProcessError as error:
-        return f"[错误] 无法读取文件:\n{error.stderr}"
+        error_message = error.stderr.decode("utf-8", errors="replace") if error.stderr else ""
+        return f"[错误] 无法读取文件:\n{error_message}"
 
 
 def svn_cat_binary(url: str) -> Optional[bytes]:
@@ -178,6 +233,7 @@ PALETTE = [
     ("syn.decorator",  "light blue",    ""),
     ("syn.type",       "light cyan",    ""),
     ("syn.error",      "light red",     ""),
+    ("line_num",       "dark gray",     ""),
 ]
 
 
@@ -280,10 +336,10 @@ class SvnBrowser:
 
         for entry in self.entries:
             icon = "📁" if entry["kind"] == "dir" else "📄"
-            name = entry["name"]
-            rev = entry["revision"]
-            author = entry["author"]
-            date = entry["date"]
+            name = sanitize_for_urwid(entry["name"])
+            rev = sanitize_for_urwid(entry["revision"])
+            author = sanitize_for_urwid(entry["author"])
+            date = sanitize_for_urwid(entry["date"])
             label = f"{icon} {name:<30} r{rev:<6} {author:<12} {date}"
 
             attr = "dir" if entry["kind"] == "dir" else "file"
@@ -339,6 +395,14 @@ class SvnBrowser:
             self._preview_alarm = None
             if is_image_file(filename):
                 self._preview_image(target_url, filename)
+            elif is_binary_file(filename):
+                ext = os.path.splitext(filename)[1].lower()
+                self._set_preview_walker([
+                    urwid.Text(("preview_title", f"📦 {filename}")),
+                    urwid.Text(""),
+                    urwid.Text(("error", f"  不支持预览 {ext} 格式的二进制文件")),
+                ])
+                self.preview_pile.contents[:] = [(self.preview_list_box, (urwid.WEIGHT, 1))]
             else:
                 self._preview_text(target_url, filename)
 
@@ -348,36 +412,88 @@ class SvnBrowser:
     def _markup_to_line_widgets(self, markup: list | str) -> list:
         """
         将 highlight_code 返回的 markup（或纯文本字符串）按行拆分，
-        每行生成一个 urwid.Text widget，供 ListBox 逐行渲染。
+        每行生成一个带行号的 Columns widget，供 ListBox 逐行渲染。
+
+        行号列固定宽度，代码列使用 wrap="space" 避免 urwid clip 模式对
+        零宽字符的 LayoutSegment sc=0 崩溃（ValueError: (0, 0, 1)）。
         """
+        # 先收集所有行的内容（str 或 [(attr, text), ...] 列表）
+        raw_lines = []
+
         if isinstance(markup, str):
-            return [urwid.Text(line, wrap="clip") for line in markup.splitlines()] or [urwid.Text("")]
+            raw_lines = markup.splitlines() or [""]
+        else:
+            current_line: list = []
+            for attr, text in markup:
+                parts = text.split("\n")
+                for index, part in enumerate(parts):
+                    if part:
+                        current_line.append((attr, part))
+                    if index < len(parts) - 1:
+                        raw_lines.append(current_line if current_line else "")
+                        current_line = []
+            raw_lines.append(current_line if current_line else "")
 
-        # markup 是 [(attr, text), ...] 列表，需要按 '\n' 切分重新组装
+        if not raw_lines:
+            raw_lines = [""]
+
+        # 根据总行数决定行号列宽度（至少 3 位，如 "  1 "）
+        total_lines = len(raw_lines)
+        line_num_width = max(3, len(str(total_lines)))
+        # 行号列总宽度 = 数字宽度 + 右侧分隔空格（" "）
+        gutter_width = line_num_width + 1
+
         line_widgets = []
-        current_line: list = []
+        for line_number, line_content in enumerate(raw_lines, start=1):
+            line_num_str = str(line_number).rjust(line_num_width) + " "
+            gutter = urwid.Text(("line_num", line_num_str), wrap="clip")
+            code = urwid.Text(line_content, wrap="space")
+            row = urwid.Columns(
+                [("given", gutter_width, gutter), code],
+                dividechars=0,
+            )
+            line_widgets.append(row)
 
-        for attr, text in markup:
-            # 一个 token 内可能含多个换行
-            parts = text.split("\n")
-            for index, part in enumerate(parts):
-                if part:
-                    current_line.append((attr, part))
-                if index < len(parts) - 1:
-                    # 遇到换行：提交当前行
-                    line_widgets.append(urwid.Text(current_line if current_line else "", wrap="clip"))
-                    current_line = []
+        return line_widgets
 
-        # 最后一行（文件末尾无换行时也要提交）
-        if current_line:
-            line_widgets.append(urwid.Text(current_line, wrap="clip"))
+    def _sanitize_text(self, text: str) -> str:
+        """
+        清理文本内容，移除会导致 urwid 渲染崩溃的字符。
 
-        return line_widgets or [urwid.Text("")]
+        urwid 使用 wcwidth 库计算字符宽度，control_codes="ignore" 模式下
+        \t 等控制字符宽度为 0，在 clip 模式下产生 sc=0 的 LayoutSegment 崩溃。
+        """
+        import unicodedata
+        # 统一换行符，去掉 \r
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        # 将 \t 展开为 4 个空格，避免 wcwidth 对控制字符返回 0
+        text = text.replace("\t", "    ")
+        cleaned_chars = []
+        for char in text:
+            if char in ("\n", " "):
+                cleaned_chars.append(char)
+                continue
+            category = unicodedata.category(char)
+            # Cc = 控制字符（\x00-\x1f 等），wcwidth 返回 -1 或 0，丢弃
+            if category == "Cc":
+                continue
+            # Cf = 格式字符（BOM、零宽空格、软连字符等），wcwidth 返回 0，丢弃
+            if category == "Cf":
+                continue
+            # Mn = 非间距组合字符（音调符号等），wcwidth 返回 0，丢弃
+            if category == "Mn":
+                continue
+            # Me = 封闭组合字符，wcwidth 返回 0，丢弃
+            if category == "Me":
+                continue
+            cleaned_chars.append(char)
+        return "".join(cleaned_chars)
 
     def _preview_text(self, url: str, filename: str):
         """预览文本文件，按行渲染到 ListBox 支持滚动"""
         self.current_image_widget = None
         content = svn_cat(url)
+        content = self._sanitize_text(content)
         markup = highlight_code(content, filename)
         line_widgets = self._markup_to_line_widgets(markup)
         self._set_preview_walker(line_widgets)
