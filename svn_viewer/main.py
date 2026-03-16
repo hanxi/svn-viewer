@@ -234,6 +234,8 @@ PALETTE = [
     ("syn.type",       "light cyan",    ""),
     ("syn.error",      "light red",     ""),
     ("line_num",       "dark gray",     ""),
+    ("search_match",         "black",  "yellow"),
+    ("search_match_current", "black",  "light green"),
 ]
 
 
@@ -283,7 +285,7 @@ class SvnBrowser:
         # Header
         header_text = urwid.Text(
             [("header", " SVN Browser  "),
-             ("header", " [j/k] 移动  [enter/→] 进入  [esc/←] 返回  [d/u] 预览翻页  [q] 退出")],
+             ("header", " [j/k] 移动  [enter/→] 进入  [esc/←] 返回  [d/u] 预览翻页  [/] 搜索  [q] 退出")],
             align="left",
         )
         header = urwid.AttrMap(header_text, "header")
@@ -311,6 +313,16 @@ class SvnBrowser:
 
         # 防抖：记录待触发的预览定时器句柄
         self._preview_alarm = None
+
+        # 搜索相关状态
+        self._search_mode = "normal"       # "normal" / "input" / "result"
+        self._search_query = ""
+        self._search_matches = []          # [(行索引, [(col_start, col_end), ...]), ...]
+        self._search_match_total = 0
+        self._search_current_idx = 0
+        self._search_edit = None
+        self._preview_text_content = ""
+        self._preview_line_markups = []
 
     def run(self):
         self.load_dir(self.current_url)
@@ -363,8 +375,21 @@ class SvnBrowser:
     def _clear_preview(self):
         """清空右侧预览区域"""
         self.current_image_widget = None
+        self._reset_search_state()
+        self._preview_text_content = ""
+        self._preview_line_markups = []
         self._set_preview_walker([urwid.Text("")])
         self.preview_pile.contents[:] = [(self.preview_list_box, (urwid.WEIGHT, 1))]
+
+    def _reset_search_state(self):
+        """重置搜索状态到普通模式"""
+        self._search_mode = "normal"
+        self._search_query = ""
+        self._search_matches = []
+        self._search_match_total = 0
+        self._search_current_idx = 0
+        self._search_edit = None
+        self._restore_footer()
 
     def _on_focus_changed(self):
         """当列表焦点变化时，取消旧定时器并安排防抖延迟加载预览"""
@@ -409,15 +434,11 @@ class SvnBrowser:
         # 延迟 0.3 秒后再真正加载，快速 j/k 时只触发最后一次
         self._preview_alarm = self.loop.set_alarm_in(0.3, _do_load)
 
-    def _markup_to_line_widgets(self, markup: list | str) -> list:
+    def _split_markup_to_lines(self, markup: list | str) -> list:
         """
         将 highlight_code 返回的 markup（或纯文本字符串）按行拆分，
-        每行生成一个带行号的 Columns widget，供 ListBox 逐行渲染。
-
-        行号列固定宽度，代码列使用 wrap="space" 避免 urwid clip 模式对
-        零宽字符的 LayoutSegment sc=0 崩溃（ValueError: (0, 0, 1)）。
+        返回逐行列表，每行是 str 或 [(attr, text), ...]。
         """
-        # 先收集所有行的内容（str 或 [(attr, text), ...] 列表）
         raw_lines = []
 
         if isinstance(markup, str):
@@ -437,10 +458,15 @@ class SvnBrowser:
         if not raw_lines:
             raw_lines = [""]
 
-        # 根据总行数决定行号列宽度（至少 3 位，如 "  1 "）
+        return raw_lines
+
+    def _lines_to_widgets(self, raw_lines: list) -> list:
+        """
+        将逐行 markup 列表转为带行号的 Columns widget 列表，
+        供 ListBox 逐行渲染。
+        """
         total_lines = len(raw_lines)
         line_num_width = max(3, len(str(total_lines)))
-        # 行号列总宽度 = 数字宽度 + 右侧分隔空格（" "）
         gutter_width = line_num_width + 1
 
         line_widgets = []
@@ -455,6 +481,17 @@ class SvnBrowser:
             line_widgets.append(row)
 
         return line_widgets
+
+    def _markup_to_line_widgets(self, markup: list | str) -> list:
+        """
+        将 highlight_code 返回的 markup（或纯文本字符串）按行拆分，
+        每行生成一个带行号的 Columns widget，供 ListBox 逐行渲染。
+
+        行号列固定宽度，代码列使用 wrap="space" 避免 urwid clip 模式对
+        零宽字符的 LayoutSegment sc=0 崩溃（ValueError: (0, 0, 1)）。
+        """
+        raw_lines = self._split_markup_to_lines(markup)
+        return self._lines_to_widgets(raw_lines)
 
     def _sanitize_text(self, text: str) -> str:
         """
@@ -492,10 +529,13 @@ class SvnBrowser:
     def _preview_text(self, url: str, filename: str):
         """预览文本文件，按行渲染到 ListBox 支持滚动"""
         self.current_image_widget = None
+        self._reset_search_state()
         content = svn_cat(url)
         content = self._sanitize_text(content)
+        self._preview_text_content = content
         markup = highlight_code(content, filename)
-        line_widgets = self._markup_to_line_widgets(markup)
+        self._preview_line_markups = self._split_markup_to_lines(markup)
+        line_widgets = self._lines_to_widgets(self._preview_line_markups)
         self._set_preview_walker(line_widgets)
         self.preview_pile.contents[:] = [(self.preview_list_box, (urwid.WEIGHT, 1))]
 
@@ -529,10 +569,242 @@ class SvnBrowser:
             (image_widget, (urwid.WEIGHT, 1)),
         ]
 
+    # ─── 搜索功能 ─────────────────────────────────────────────────────────────
+
+    def _inject_search_highlights(self, line_markup, matches_in_line, current_match_cols):
+        """
+        将搜索匹配区间注入到单行 markup 中，返回新的 markup 列表。
+
+        line_markup: str 或 [(attr, text), ...]
+        matches_in_line: [(col_start, col_end), ...] 该行所有匹配区间
+        current_match_cols: (col_start, col_end) 或 None，当前选中的匹配区间
+        """
+        # 统一为 [(attr, text), ...] 格式
+        if isinstance(line_markup, str):
+            segments = [("", line_markup)]
+        elif isinstance(line_markup, list) and line_markup:
+            segments = line_markup
+        else:
+            segments = [("", "")]
+
+        # 为每个字符位置标记是否匹配、是否是当前匹配
+        # 先把全行纯文本提取出来
+        full_text = "".join(text for _, text in segments)
+        total_len = len(full_text)
+        if total_len == 0:
+            return segments
+
+        # 构建字符级别的高亮标记数组: 0=无, 1=普通匹配, 2=当前匹配
+        highlight = [0] * total_len
+        for col_start, col_end in matches_in_line:
+            for i in range(col_start, min(col_end, total_len)):
+                highlight[i] = 1
+        if current_match_cols is not None:
+            cs, ce = current_match_cols
+            for i in range(cs, min(ce, total_len)):
+                highlight[i] = 2
+
+        # 遍历原 segments，按高亮标记拆分
+        result = []
+        char_offset = 0
+        for orig_attr, text in segments:
+            for i, ch in enumerate(text):
+                pos = char_offset + i
+                h = highlight[pos] if pos < total_len else 0
+                if h == 2:
+                    attr = "search_match_current"
+                elif h == 1:
+                    attr = "search_match"
+                else:
+                    attr = orig_attr
+                # 尝试合并到上一个 segment
+                if result and result[-1][0] == attr:
+                    result[-1] = (attr, result[-1][1] + ch)
+                else:
+                    result.append((attr, ch))
+            char_offset += len(text)
+
+        return result
+
+    def _rebuild_preview_with_highlights(self):
+        """用注入搜索高亮后的 markup 重建 preview_walker"""
+        if not self._preview_line_markups:
+            return
+
+        # 构建 "展平匹配索引 → (行索引, 匹配在行内的序号)" 的映射
+        # 以及 "行索引 → [(col_start, col_end), ...]" 的映射
+        line_matches_map = {}
+        flat_idx = 0
+        current_line_idx = None
+        current_col_range = None
+        for line_idx, cols in self._search_matches:
+            line_matches_map[line_idx] = cols
+            for col_range in cols:
+                if flat_idx == self._search_current_idx:
+                    current_line_idx = line_idx
+                    current_col_range = col_range
+                flat_idx += 1
+
+        highlighted_lines = []
+        for i, line_markup in enumerate(self._preview_line_markups):
+            if i in line_matches_map:
+                cur = current_col_range if i == current_line_idx else None
+                new_markup = self._inject_search_highlights(
+                    line_markup, line_matches_map[i], cur
+                )
+                highlighted_lines.append(new_markup)
+            else:
+                highlighted_lines.append(line_markup)
+
+        line_widgets = self._lines_to_widgets(highlighted_lines)
+        self._set_preview_walker(line_widgets)
+        self.preview_pile.contents[:] = [(self.preview_list_box, (urwid.WEIGHT, 1))]
+
+    def _restore_footer(self):
+        """恢复 footer 为正常路径显示"""
+        self.footer_text.set_text([("footer", f" {self.current_url}")])
+        self.frame.footer = urwid.AttrMap(self.footer_text, "footer")
+        self.frame.focus_position = "body"
+
+    def _enter_search_mode(self):
+        """进入搜索输入模式"""
+        if not self._preview_text_content:
+            return
+        self._search_mode = "input"
+        self._search_edit = urwid.Edit(("header", "/"))
+        self.frame.footer = urwid.AttrMap(self._search_edit, "footer")
+        self.frame.focus_position = "footer"
+
+    def _execute_search(self):
+        """执行搜索"""
+        query = self._search_edit.edit_text.strip()
+        if not query:
+            self._exit_search_mode()
+            return
+
+        self._search_query = query
+        query_lower = query.lower()
+        lines = self._preview_text_content.splitlines()
+
+        self._search_matches = []
+        self._search_match_total = 0
+        for line_idx, line_text in enumerate(lines):
+            line_lower = line_text.lower()
+            cols = []
+            start = 0
+            while True:
+                pos = line_lower.find(query_lower, start)
+                if pos == -1:
+                    break
+                cols.append((pos, pos + len(query)))
+                start = pos + 1
+            if cols:
+                self._search_matches.append((line_idx, cols))
+                self._search_match_total += len(cols)
+
+        if self._search_match_total == 0:
+            # 无匹配
+            self._search_mode = "result"
+            self._search_current_idx = 0
+            info = urwid.Text(
+                [("header", f" 未找到: \"{query}\"  "),
+                 ("header", " Esc: 返回")],
+                align="left",
+            )
+            self.frame.footer = urwid.AttrMap(info, "footer")
+            self.frame.focus_position = "body"
+            return
+
+        self._search_mode = "result"
+        self._search_current_idx = 0
+        self._rebuild_preview_with_highlights()
+        self._jump_to_current_match()
+        self.frame.focus_position = "body"
+
+    def _jump_to_current_match(self):
+        """滚动到当前匹配行并更新 footer 状态"""
+        flat_idx = 0
+        target_line = 0
+        for line_idx, cols in self._search_matches:
+            for _ in cols:
+                if flat_idx == self._search_current_idx:
+                    target_line = line_idx
+                flat_idx += 1
+
+        if target_line < len(self.preview_walker):
+            self.preview_walker.set_focus(target_line)
+
+        current_display = self._search_current_idx + 1
+        info = urwid.Text(
+            [("header", f" 搜索: \"{self._search_query}\" [{current_display}/{self._search_match_total}]  "),
+             ("header", " n/N: 导航  Esc: 清除")],
+            align="left",
+        )
+        self.frame.footer = urwid.AttrMap(info, "footer")
+
+    def _search_next(self):
+        """跳转到下一个匹配"""
+        if self._search_match_total == 0:
+            return
+        self._search_current_idx = (self._search_current_idx + 1) % self._search_match_total
+        self._rebuild_preview_with_highlights()
+        self._jump_to_current_match()
+
+    def _search_prev(self):
+        """跳转到上一个匹配"""
+        if self._search_match_total == 0:
+            return
+        self._search_current_idx = (self._search_current_idx - 1) % self._search_match_total
+        self._rebuild_preview_with_highlights()
+        self._jump_to_current_match()
+
+    def _exit_search_mode(self):
+        """退出搜索模式"""
+        was_in_search = self._search_mode != "normal"
+        self._search_mode = "normal"
+        self._search_query = ""
+        self._search_matches = []
+        self._search_match_total = 0
+        self._search_current_idx = 0
+        self._search_edit = None
+        self._restore_footer()
+        # 如果之前有搜索高亮，恢复原始预览
+        if was_in_search and self._preview_line_markups:
+            line_widgets = self._lines_to_widgets(self._preview_line_markups)
+            self._set_preview_walker(line_widgets)
+            self.preview_pile.contents[:] = [(self.preview_list_box, (urwid.WEIGHT, 1))]
+
     def handle_input(self, key: str | tuple) -> bool | None:
         """处理全局按键（key 为字符串，鼠标事件为 tuple，直接忽略）"""
         if isinstance(key, tuple):
             return None
+
+        # 搜索输入模式：只处理 enter/esc，其他键由 Edit 控件消费
+        if self._search_mode == "input":
+            if key == "enter":
+                self._execute_search()
+                return
+            if key == "esc":
+                self._exit_search_mode()
+                return
+            return
+
+        # 搜索结果模式
+        if self._search_mode == "result":
+            if key == "n":
+                self._search_next()
+                return
+            if key == "N":
+                self._search_prev()
+                return
+            if key == "esc":
+                self._exit_search_mode()
+                return
+            if key == "/":
+                self._enter_search_mode()
+                return
+            # 其他键 fall through 到正常处理
+
         if key in ("q", "Q"):
             raise urwid.ExitMainLoop()
 
@@ -558,6 +830,10 @@ class SvnBrowser:
 
         if key in ("u", "page up"):
             self._scroll_preview(-10)
+            return
+
+        if key == "/":
+            self._enter_search_mode()
             return
 
     def _scroll_preview(self, lines: int):
